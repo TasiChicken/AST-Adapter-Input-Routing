@@ -149,6 +149,8 @@ def get_args():
     parser.add_argument('--tau_init', default=2.0, type=float)
     parser.add_argument('--tp_adapter_in', default=False, type=lambda x: bool(eval(x)))
     parser.add_argument('--tp_branch_key', default='sp_tp_relu', type=str)
+    parser.add_argument('--tau_end', default=0.1, type=float)
+    parser.add_argument('--tau_decay_epochs', default=15, type=int)
 
     # Hard routing parameters
     parser.add_argument('--routing_type', default='static', choices=['static', 'input'])
@@ -225,6 +227,10 @@ def get_args():
 
     return parser.parse_args(), ds_init
 
+def set_gumbel_tau(model, tau):
+    for module in model.modules():
+        if hasattr(module, "tau"):
+            module.tau = tau
 
 def main(args, ds_init):
     utils.init_distributed_mode(args)
@@ -559,6 +565,15 @@ def main(args, ds_init):
     start_time = time.time()
     max_accuracy = 0.0
     for epoch in range(args.start_epoch, args.epochs):
+        if args.tau_decay_epochs > 0:
+            progress = min(float(epoch + 1) / float(args.tau_decay_epochs), 1.0)
+            current_tau = args.tau_init + progress * (args.tau_end - args.tau_init)
+        else:
+            current_tau = args.tau_end
+
+        set_gumbel_tau(model_without_ddp, current_tau)
+        print(f"Gumbel tau = {current_tau:.6f}")
+
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
         if log_writer is not None:

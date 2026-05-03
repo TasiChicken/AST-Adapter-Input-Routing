@@ -87,6 +87,58 @@ class paramnetwork(nn.Module):
         self.p = nn.Parameter(t)
     def forward(self,x):
         return self.p.unsqueeze(0).expand(x.size(0),-1)
+    
+class InputDependentParamNetwork(nn.Module):
+    """
+    Input-dependent routing predictor for AST-Adapter.
+
+    Input:
+        x: [B, C, T, H, W]
+    Output:
+        logits: [B, num_branches]
+    """
+    def __init__(
+        self,
+        dim,
+        num_branches,
+        use_motion=False,
+        use_layer_norm=True,
+        motion_norm=True,
+    ):
+        super().__init__()
+        self.use_motion = use_motion
+        self.motion_norm = motion_norm
+        self.norm = nn.LayerNorm(dim) if use_layer_norm else nn.Identity()
+        self.fc = nn.Linear(dim + (1 if use_motion else 0), num_branches)
+
+        # Start from uniform routing, similar to static logits = [1, 1, 1].
+        nn.init.zeros_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
+
+    def forward(self, x):
+        # x: [B, C, T, H, W]
+        if x.dim() != 5:
+            raise ValueError(f"Expected x with shape [B,C,T,H,W], got {x.shape}")
+
+        z = x.mean(dim=(2, 3, 4))  # [B, C]
+        z = self.norm(z)
+
+        if self.use_motion:
+            if x.size(2) > 1:
+                motion = (x[:, :, 1:] - x[:, :, :-1]).abs().mean(dim=(1, 2, 3, 4))
+            else:
+                motion = torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+
+            motion = motion.unsqueeze(-1)  # [B, 1]
+
+            if self.motion_norm:
+                motion = (motion - motion.mean(dim=0, keepdim=True)) / (
+                    motion.std(dim=0, keepdim=True) + 1e-6
+                )
+
+            z = torch.cat([z, motion], dim=-1)
+
+        return self.fc(z)
 
 
 class DropPath(nn.Module):
@@ -189,14 +241,14 @@ class Block(nn.Module):
         
         def make_down():
             l = nn.Conv3d(dim, config.bottle_dim, (1,1,1), (1,1,1), (0,0,0))
-            if config.dataset =='HMDB51' or self.config.dataset=='UCF_101' or self.config.dataset=='SSV2':
+            if config.dataset == 'HMDB51' or self.config.dataset == 'UCF101' or self.config.dataset == 'SSV2':
                 nn.init.zeros_(l.weight)
                 nn.init.zeros_(l.bias)
             return l
         
         def make_up():
             l = nn.Conv3d(config.bottle_dim, dim, (1,1,1), (1,1,1), (0,0,0))
-            if config.dataset =='HMDB51' or self.config.dataset=='UCF_101' or self.config.dataset=='SSV2':
+            if config.dataset == 'HMDB51' or self.config.dataset == 'UCF101' or self.config.dataset == 'SSV2':
                 nn.init.zeros_(l.weight)
                 nn.init.zeros_(l.bias)
             return l
@@ -298,13 +350,13 @@ class Block(nn.Module):
         
         if self.config.tp_adapter_att:
             
-            if self.config.adapter_str == 'sequential':
+            if self.config.adapter_str_a == 'sequential':
              
                 self.dpconv_a = [nn.Conv3d(config.bottle_dim, config.bottle_dim, (3,1,1), padding=(1,0,0), groups=config.bottle_dim)]
-                sub_0_a = [make_down()] + self.dpconv + [make_up()]
-                self.net_l_a = nn.Sequential(*sub_0)
+                sub_0_a = [make_down()] + self.dpconv_a + [make_up()]
+                self.net_l_a = nn.Sequential(*sub_0_a)
             
-            elif self.config.adapter_str == "gumbel":
+            elif self.config.adapter_str_a == "gumbel":
                 
                 
                

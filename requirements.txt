@@ -1,0 +1,16 @@
+torch>=2.0.0
+torchvision
+timm==0.4.12
+decord
+einops
+pandas
+numpy
+scipy
+scikit-learn
+tensorboardX
+opencv-python
+Pillow
+easydict
+tqdm
+gdown
+rarfile
