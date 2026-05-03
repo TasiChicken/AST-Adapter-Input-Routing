@@ -23,6 +23,9 @@ from utils import  multiple_samples_collate
 import utils
 import modeling_finetune
 
+from easydict import EasyDict
+import modeling_ast_adapter
+
 
 def get_args():
     parser = argparse.ArgumentParser('VideoMAE fine-tuning and evaluation script for video classification', add_help=False)
@@ -135,6 +138,17 @@ def get_args():
     parser.add_argument('--use_mean_pooling', action='store_true')
     parser.set_defaults(use_mean_pooling=True)
     parser.add_argument('--use_cls', action='store_false', dest='use_mean_pooling')
+
+    # AST-Adapter parameters
+    parser.add_argument('--tp_adapter_mlp', action='store_true', default=False)
+    parser.add_argument('--tp_adapter_att', action='store_true', default=False)
+    parser.add_argument('--tp_bottle_dim', default=64, type=int)
+    parser.add_argument('--adapter_str', default='gumbel', type=str)
+    parser.add_argument('--adapter_str_a', default='gumbel', type=str)
+    parser.add_argument('--scale', default=0.5, type=float)
+    parser.add_argument('--tau_init', default=2.0, type=float)
+    parser.add_argument('--tp_adapter_in', default=False, type=lambda x: bool(eval(x)))
+    parser.add_argument('--tp_branch_key', default='sp_tp_relu', type=str)
 
     # Dataset parameters
     parser.add_argument('--data_path', default='/path/to/list_kinetics-400', type=str,
@@ -300,6 +314,22 @@ def main(args, ds_init):
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
+    tuning_config = EasyDict(
+        tp_adapter_mlp=args.tp_adapter_mlp,
+        tp_adapter_att=args.tp_adapter_att,
+        bottle_dim=args.tp_bottle_dim,
+        conv_group=None,
+        adapter_in=args.tp_adapter_in,
+        branch_key=args.tp_branch_key,
+        dataset=args.data_set,
+        adapter_str=args.adapter_str,
+        adapter_str_a=args.adapter_str_a,
+        frame=args.num_frames,
+        scale=args.scale,
+        tau_init=args.tau_init,
+        trainable=False,
+    )
+
     model = create_model(
         args.model,
         pretrained=False,
@@ -314,6 +344,7 @@ def main(args, ds_init):
         use_checkpoint=args.use_checkpoint,
         use_mean_pooling=args.use_mean_pooling,
         init_scale=args.init_scale,
+        config=tuning_config,
     )
 
     patch_size = model.patch_embed.patch_size
@@ -383,6 +414,32 @@ def main(args, ds_init):
                 checkpoint_model['pos_embed'] = new_pos_embed
 
         utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
+
+    # Freeze all parameters first
+    for name, p in model.named_parameters():
+        p.requires_grad = False
+
+    # Unfreeze AST-Adapter and classification head
+    trainable_keywords = [
+        "gumbel",      # GumbelNetwork and gate logits
+        "net_l",       # MLP-side adapter, if sequential
+        "net_l_a",     # attention-side adapter, if used
+        "head",        # classifier
+    ]
+
+    for name, p in model.named_parameters():
+        if any(k in name for k in trainable_keywords):
+            p.requires_grad = True
+
+    # Sanity check
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
+    print(f"Trainable parameters: {n_trainable / 1e6:.3f}M")
+    print(f"Total parameters: {n_total / 1e6:.3f}M")
+
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            print("[trainable]", name, p.numel())
 
     model.to(device)
 
