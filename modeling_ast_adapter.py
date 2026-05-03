@@ -133,7 +133,7 @@ class InputDependentParamNetwork(nn.Module):
 
             if self.motion_norm:
                 motion = (motion - motion.mean(dim=0, keepdim=True)) / (
-                    motion.std(dim=0, keepdim=True) + 1e-6
+                    motion.std(dim=0, keepdim=True, unbiased=False) + 1e-6
                 )
 
             z = torch.cat([z, motion], dim=-1)

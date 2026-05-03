@@ -633,6 +633,9 @@ def create_random_augment(
             of operations to apply).
         interpolation: Interpolation method.
     """
+    if auto_augment is None or str(auto_augment).lower() in ["none", "no", "false", "0", ""]:
+        return transforms.Compose([])
+
     if isinstance(input_size, tuple):
         img_size = input_size[-2:]
     else:

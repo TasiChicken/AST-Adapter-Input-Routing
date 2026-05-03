@@ -188,6 +188,7 @@ def final_test(data_loader, model, device, file):
     # switch to evaluation mode
     model.eval()
     final_result = []
+    route_stats = {}
     
     for batch in metric_logger.log_every(data_loader, 10, header):
         videos = batch[0]
@@ -232,7 +233,7 @@ def final_test(data_loader, model, device, file):
         metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
 
     if not os.path.exists(file):
-        os.mknod(file)
+        open(file, 'a').close()
     with open(file, 'w') as f:
         f.write("{}, {}\n".format(acc1, acc5))
         for line in final_result:
@@ -281,7 +282,7 @@ def merge(eval_path, num_tasks):
             label = line.split(']')[1].split(' ')[1]
             chunk_nb = line.split(']')[1].split(' ')[2]
             split_nb = line.split(']')[1].split(' ')[3]
-            data = np.fromstring(line.split('[')[1].split(']')[0], dtype=np.float, sep=',')
+            data = np.fromstring(line.split('[')[1].split(']')[0], dtype=np.float64, sep=',')
             data = softmax(data)
             if not name in dict_feats:
                 dict_feats[name] = []
