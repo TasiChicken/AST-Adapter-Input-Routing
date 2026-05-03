@@ -150,6 +150,13 @@ def get_args():
     parser.add_argument('--tp_adapter_in', default=False, type=lambda x: bool(eval(x)))
     parser.add_argument('--tp_branch_key', default='sp_tp_relu', type=str)
 
+    # Hard routing parameters
+    parser.add_argument('--routing_type', default='static', choices=['static', 'input'])
+    parser.add_argument('--use_motion_gate', action='store_true', default=False)
+    parser.add_argument('--no_motion_gate', action='store_false', dest='use_motion_gate')
+    parser.add_argument('--motion_gate_norm', action='store_true', default=True)
+    parser.add_argument('--no_motion_gate_norm', action='store_false', dest='motion_gate_norm')
+
     # Dataset parameters
     parser.add_argument('--data_path', default='/path/to/list_kinetics-400', type=str,
                         help='dataset path')
@@ -328,6 +335,9 @@ def main(args, ds_init):
         scale=args.scale,
         tau_init=args.tau_init,
         trainable=False,
+        routing_type=args.routing_type,
+        use_motion_gate=args.use_motion_gate,
+        motion_gate_norm=args.motion_gate_norm,
     )
 
     model = create_model(

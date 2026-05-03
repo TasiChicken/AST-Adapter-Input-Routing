@@ -275,9 +275,23 @@ class Block(nn.Module):
                 names = [ names[i] for i in index ]
                 logit = [ 1.0 for i in index]
 
+                routing_type = get_value(config, "routing_type", "static")
+                use_motion_gate = get_value(config, "use_motion_gate", False)
+                motion_gate_norm = get_value(config, "motion_gate_norm", True)
+
+                if routing_type == "input":
+                    predictor = InputDependentParamNetwork(
+                        dim=dim,
+                        num_branches=len(index),
+                        use_motion=use_motion_gate,
+                        motion_norm=motion_gate_norm,
+                    )
+                else:
+                    predictor = paramnetwork(torch.as_tensor(logit))
+
                 self.gumbel = GumbelNetwork(
                     pre, net_l, post,
-                    paramnetwork(torch.as_tensor(logit)),
+                    predictor,
                     self.config.tau_init
                 )
                 self.inter_key = names
@@ -356,9 +370,23 @@ class Block(nn.Module):
                 names = [ names[i] for i in index ]
                 logit = [ 1.0 for i in index]
 
+                routing_type = get_value(config, "routing_type", "static")
+                use_motion_gate = get_value(config, "use_motion_gate", False)
+                motion_gate_norm = get_value(config, "motion_gate_norm", True)
+
+                if routing_type == "input":
+                    predictor_a = InputDependentParamNetwork(
+                        dim=dim,
+                        num_branches=len(index),
+                        use_motion=use_motion_gate,
+                        motion_norm=motion_gate_norm,
+                    )
+                else:
+                    predictor_a = paramnetwork(torch.as_tensor(logit))
+
                 self.gumbel_a = GumbelNetwork(
                     pre_a, net_l_a, post_a,
-                    paramnetwork(torch.as_tensor(logit)),
+                    predictor_a,
                     self.config.tau_init
                 )
                 self.inter_key_a = names
