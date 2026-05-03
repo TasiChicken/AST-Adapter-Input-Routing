@@ -150,6 +150,8 @@ def validation_one_epoch(data_loader, model, device):
     # switch to evaluation mode
     model.eval()
 
+    route_stats = {}
+
     for batch in metric_logger.log_every(data_loader, 10, header):
         videos = batch[0]
         target = batch[1]
@@ -201,6 +203,19 @@ def final_test(data_loader, model, device, file):
             output = model(videos)
             loss = criterion(output, target)
 
+        # AST-Adapter routing statistics
+        model_to_check = model.module if hasattr(model, "module") else model
+
+        for layer_id, blk in enumerate(model_to_check.blocks):
+            if hasattr(blk, "inter_idx"):
+                idx = blk.inter_idx.detach().cpu()  # [B]
+
+                if layer_id not in route_stats:
+                    route_stats[layer_id] = torch.zeros(3, dtype=torch.long)
+
+                counts = torch.bincount(idx, minlength=3)
+                route_stats[layer_id] += counts
+
         for i in range(output.size(0)):
             string = "{} {} {} {} {}\n".format(ids[i], \
                                                 str(output.data[i].cpu().numpy().tolist()), \
@@ -226,6 +241,27 @@ def final_test(data_loader, model, device, file):
     metric_logger.synchronize_between_processes()
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+
+    # Print AST-Adapter routing statistics
+    if len(route_stats) > 0:
+        print("\n[AST-Adapter Routing Statistics]")
+        branch_names = ["sp", "tp", "relu"]
+
+        for layer_id in sorted(route_stats.keys()):
+            counts = route_stats[layer_id].float()
+            ratio = counts / counts.sum().clamp(min=1)
+
+            ratio_str = ", ".join([
+                f"{branch_names[i]}={ratio[i].item():.3f}"
+                for i in range(len(branch_names))
+            ])
+
+            count_str = ", ".join([
+                f"{branch_names[i]}={int(counts[i].item())}"
+                for i in range(len(branch_names))
+            ])
+
+            print(f"Layer {layer_id:02d}: {ratio_str} | counts: {count_str}")
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 

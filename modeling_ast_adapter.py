@@ -424,6 +424,9 @@ class Block(nn.Module):
                     x_adapt, aux = self.gumbel(x_bcdhw)
 
                     self.inter_out = aux["log_p"]
+
+                    self.inter_idx = aux["index"]
+                    self.inter_gumbel = aux["gumbl"]
                 
                 tp_adapt = x_adapt.flatten(2).transpose(1,2)
             
