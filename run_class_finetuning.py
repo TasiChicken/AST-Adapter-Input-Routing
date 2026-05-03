@@ -337,7 +337,7 @@ def main(args, ds_init):
         dataset=args.data_set,
         adapter_str=args.adapter_str,
         adapter_str_a=args.adapter_str_a,
-        frame=args.num_frames,
+        frame=args.num_frames // args.tubelet_size,
         scale=args.scale,
         tau_init=args.tau_init,
         trainable=False,
