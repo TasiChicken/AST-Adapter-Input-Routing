@@ -278,11 +278,28 @@ def merge(eval_path, num_tasks):
         lines = open(file, 'r').readlines()[1:]
         for line in lines:
             line = line.strip()
-            name = line.split('[')[0]
-            label = line.split(']')[1].split(' ')[1]
-            chunk_nb = line.split(']')[1].split(' ')[2]
-            split_nb = line.split(']')[1].split(' ')[3]
-            data = np.fromstring(line.split('[')[1].split(']')[0], dtype=np.float64, sep=',')
+            left = line.rfind('[')
+            right = line.rfind(']')
+            if left < 0 or right < 0 or right <= left:
+                print("[merge skip] cannot find logits brackets:", repr(line[:300]))
+                continue
+
+            name = line[:left].strip()
+            tail = line[right + 1:].strip().split()
+            if len(tail) < 3:
+                print("[merge skip] invalid tail:", repr(line[:300]))
+                continue
+
+            label = tail[0]
+            chunk_nb = tail[1]
+            split_nb = tail[2]
+
+            data_str = line[left + 1:right]
+            data = np.fromstring(data_str, dtype=np.float64, sep=',')
+            if data.size == 0:
+                print("[merge skip] empty logits:", repr(line[:300]))
+                continue
+
             data = softmax(data)
             if not name in dict_feats:
                 dict_feats[name] = []
