@@ -15,6 +15,77 @@ def train_class_batch(model, samples, target, criterion):
     loss = criterion(outputs, target)
     return loss, outputs
 
+@torch.no_grad()
+def update_route_stats(model, route_stats, device, num_branches=3):
+    """
+    Update routing statistics for the current batch.
+    This should be called after output = model(videos),
+    because blk.inter_idx is created during forward.
+    """
+    model_to_check = model.module if hasattr(model, "module") else model
+
+    for layer_id, blk in enumerate(model_to_check.blocks):
+        if hasattr(blk, "inter_idx"):
+            idx = blk.inter_idx.detach().to(device).long()  # [B]
+
+            if layer_id not in route_stats:
+                route_stats[layer_id] = torch.zeros(
+                    num_branches,
+                    dtype=torch.long,
+                    device=device
+                )
+
+            counts = torch.bincount(idx, minlength=num_branches)
+            route_stats[layer_id] += counts
+
+
+@torch.no_grad()
+def sync_route_stats(route_stats, device):
+    """
+    Synchronize routing statistics across all DDP ranks.
+    Without this, each process only reports its own local subset.
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        for layer_id in route_stats:
+            route_stats[layer_id] = route_stats[layer_id].to(device)
+            torch.distributed.all_reduce(
+                route_stats[layer_id],
+                op=torch.distributed.ReduceOp.SUM
+            )
+
+    return route_stats
+
+
+@torch.no_grad()
+def print_route_stats(route_stats, title="[AST-Adapter Routing Statistics]"):
+    """
+    Print routing statistics.
+    Only call this on the main process to avoid duplicate logs.
+    """
+    if len(route_stats) == 0:
+        print(f"\n{title}")
+        print("No routing statistics found.")
+        return
+
+    branch_names = ["sp", "tp", "relu"]
+
+    print(f"\n{title}")
+    for layer_id in sorted(route_stats.keys()):
+        counts = route_stats[layer_id].detach().cpu().float()
+        ratio = counts / counts.sum().clamp(min=1)
+
+        ratio_str = ", ".join([
+            f"{branch_names[i]}={ratio[i].item():.3f}"
+            for i in range(len(branch_names))
+        ])
+
+        count_str = ", ".join([
+            f"{branch_names[i]}={int(counts[i].item())}"
+            for i in range(len(branch_names))
+        ])
+
+        print(f"Layer {layer_id:02d}: {ratio_str} | counts: {count_str}")    
+
 
 def get_loss_scale_for_deepspeed(model):
     optimizer = model.optimizer
@@ -29,16 +100,27 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     num_training_steps_per_epoch=None, update_freq=None):
     model.train(True)
     metric_logger = utils.MetricLogger(delimiter="  ")
+    route_stats = {}
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
     if loss_scaler is None:
-        model.zero_grad()
-        model.micro_steps = 0
+        samples = samples.half()
+        loss, output = train_class_batch(
+            model, samples, targets, criterion)
+
+        # update train routing statistics after forward
+        update_route_stats(model, route_stats, device)
+
     else:
-        optimizer.zero_grad()
+        with torch.cuda.amp.autocast():
+            loss, output = train_class_batch(
+                model, samples, targets, criterion)
+
+        # update train routing statistics after forward
+        update_route_stats(model, route_stats, device)
 
     for data_iter_step, (samples, targets, _, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         step = data_iter_step // update_freq
@@ -136,9 +218,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
+    # gather routing stats from all DDP ranks
+    route_stats = sync_route_stats(route_stats, device)
+
+    print("Averaged stats:", metric_logger)
+
+    if utils.is_main_process():
+        print_route_stats(route_stats, title=f"[Train AST-Adapter Routing Statistics][Epoch {epoch}]")
+
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 @torch.no_grad()
 def validation_one_epoch(data_loader, model, device):
@@ -161,6 +250,10 @@ def validation_one_epoch(data_loader, model, device):
         # compute output
         with torch.cuda.amp.autocast():
             output = model(videos)
+
+            # update routing statistics after forward
+            update_route_stats(model, route_stats, device)
+
             loss = criterion(output, target)
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -169,10 +262,19 @@ def validation_one_epoch(data_loader, model, device):
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
         metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
+
+    # gather routing stats from all DDP ranks
+    route_stats = sync_route_stats(route_stats, device)
+
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+
+    # print only on main process
+    if utils.is_main_process():
+        print_route_stats(route_stats, title="[Val AST-Adapter Routing Statistics]")
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
@@ -205,17 +307,7 @@ def final_test(data_loader, model, device, file):
             loss = criterion(output, target)
 
         # AST-Adapter routing statistics
-        model_to_check = model.module if hasattr(model, "module") else model
-
-        for layer_id, blk in enumerate(model_to_check.blocks):
-            if hasattr(blk, "inter_idx"):
-                idx = blk.inter_idx.detach().cpu()  # [B]
-
-                if layer_id not in route_stats:
-                    route_stats[layer_id] = torch.zeros(3, dtype=torch.long)
-
-                counts = torch.bincount(idx, minlength=3)
-                route_stats[layer_id] += counts
+        update_route_stats(model, route_stats, device)
 
         for i in range(output.size(0)):
             string = "{} {} {} {} {}\n".format(ids[i], \
@@ -243,26 +335,12 @@ def final_test(data_loader, model, device, file):
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
 
-    # Print AST-Adapter routing statistics
-    if len(route_stats) > 0:
-        print("\n[AST-Adapter Routing Statistics]")
-        branch_names = ["sp", "tp", "relu"]
+    # gather routing stats from all DDP ranks
+    route_stats = sync_route_stats(route_stats, device)
 
-        for layer_id in sorted(route_stats.keys()):
-            counts = route_stats[layer_id].float()
-            ratio = counts / counts.sum().clamp(min=1)
-
-            ratio_str = ", ".join([
-                f"{branch_names[i]}={ratio[i].item():.3f}"
-                for i in range(len(branch_names))
-            ])
-
-            count_str = ", ".join([
-                f"{branch_names[i]}={int(counts[i].item())}"
-                for i in range(len(branch_names))
-            ])
-
-            print(f"Layer {layer_id:02d}: {ratio_str} | counts: {count_str}")
+    # Print AST-Adapter routing statistics only on main process
+    if utils.is_main_process():
+        print_route_stats(route_stats, title="[Test AST-Adapter Routing Statistics]")
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 

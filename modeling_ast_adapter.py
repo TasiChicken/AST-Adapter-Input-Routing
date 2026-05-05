@@ -242,7 +242,7 @@ class Block(nn.Module):
         def make_down():
             l = nn.Conv3d(dim, config.bottle_dim, (1,1,1), (1,1,1), (0,0,0))
             if config.dataset == 'HMDB51' or self.config.dataset == 'UCF101' or self.config.dataset == 'SSV2':
-                nn.init.zeros_(l.weight)
+                nn.init.kaiming_normal_(l.weight, mode="fan_out", nonlinearity="relu")
                 nn.init.zeros_(l.bias)
             return l
         
@@ -444,57 +444,29 @@ class Block(nn.Module):
                 self.inter_key_a = names
 
     def forward(self, x):
-        if self.gamma_1 is None:
-            B,h,d = x.shape
-            t = self.config.frame
-            H = int(math.sqrt(h/(self.config.frame)))
-           
-            if self.config.tp_adapter_att:                
-                x_bcdhw = x.transpose(1,2).reshape(B,d,t,H,H)
-                
-                if self.config.adapter_str_a == 'sequential':       
-                    x_adapt =  self.net_l_a(x_bcdhw) 
-                
-                elif self.config.adapter_str_a =='gumbel':
-                    x_adapt, aux = self.gumbel_a(x_bcdhw)
+        logits = self.predictor(x)
+        prep_x = self.pre_network(x)
+        values = [m(prep_x) for m in self.sub_nets]
+        val = torch.stack(values, dim=1)
 
-                    self.inter_out_a = aux["log_p"]
-                
-                tp_adapt = x_adapt.flatten(2).transpose(1,2)
-                x = x + self.config.scale*tp_adapt
-            
-            x = x + self.drop_path(self.attn(self.norm1(x)))
-            
-           
-            if self.config.tp_adapter_mlp:                
-                x_bcdhw = x.transpose(1,2).reshape(B,d,t,H,H)
-                
-                if self.config.adapter_str == 'sequential':       
-                    x_adapt =  self.net_l(x_bcdhw) 
-                
-                elif self.config.adapter_str == 'gumbel':
-                    x_adapt, aux = self.gumbel(x_bcdhw)
-
-                    self.inter_out = aux["log_p"]
-
-                    self.inter_idx = aux["index"]
-                    self.inter_gumbel = aux["gumbl"]
-                
-                tp_adapt = x_adapt.flatten(2).transpose(1,2)
-            
-            residual = x
-            
-            x =  self.drop_path(self.mlp(self.norm2(x)))         
-        
-            if self.config.tp_adapter_mlp:           
-                x = x + self.config.scale*tp_adapt
-            
-            x = residual + x
-           
+        if self.training:
+            gumb = F.gumbel_softmax(logits, tau=self.tau, hard=True, dim=-1)
+            idx = gumb.argmax(dim=-1)
+            out = torch.einsum("bk,bk...->b...", gumb, val)
         else:
-            x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x)))
-            x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
-        return x
+            prob = F.softmax(logits / self.tau, dim=-1)
+            idx = prob.argmax(dim=-1)
+            gbl = F.one_hot(idx, val.size(1)).float()
+            out = torch.einsum("bk,bk...->b...", gbl, val)
+
+        out = self.post_network(out)
+        aux = {
+            "index": idx,
+            "log_p": F.log_softmax(logits, dim=-1),
+            "prob": F.softmax(logits, dim=-1),
+            "gumbl": gumb if self.training else gbl,
+        }
+        return out, aux
 
 
 class PatchEmbed(nn.Module):
