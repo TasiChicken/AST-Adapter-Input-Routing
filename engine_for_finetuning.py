@@ -106,22 +106,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
-    if loss_scaler is None:
-        samples = samples.half()
-        loss, output = train_class_batch(
-            model, samples, targets, criterion)
-
-        # update train routing statistics after forward
-        update_route_stats(model, route_stats, device)
-
-    else:
-        with torch.cuda.amp.autocast():
-            loss, output = train_class_batch(
-                model, samples, targets, criterion)
-
-        # update train routing statistics after forward
-        update_route_stats(model, route_stats, device)
-
     for data_iter_step, (samples, targets, _, _) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         step = data_iter_step // update_freq
         if step >= num_training_steps_per_epoch:
@@ -150,6 +134,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 loss, output = train_class_batch(
                     model, samples, targets, criterion)
 
+        update_route_stats(model, route_stats, device)
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
