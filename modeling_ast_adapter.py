@@ -234,7 +234,7 @@ class Block(nn.Module):
         def make_down():
             l = nn.Conv3d(dim, config.bottle_dim, (1,1,1), (1,1,1), (0,0,0))
             if config.dataset == 'HMDB51' or self.config.dataset == 'UCF101' or self.config.dataset == 'SSV2':
-                nn.init.kaiming_normal_(l.weight, mode="fan_out", nonlinearity="relu")
+                nn.init.zeros_(l.weight)
                 nn.init.zeros_(l.bias)
             return l
         
