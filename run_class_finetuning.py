@@ -159,6 +159,8 @@ def get_args():
     parser.add_argument('--motion_gate_norm', action='store_true', default=True)
     parser.add_argument('--no_motion_gate_norm', action='store_false', dest='motion_gate_norm')
 
+    parser.add_argument("--gumbel_routing_mode", default="hard", choices=["hard", "soft"], type=str)
+
     # Dataset parameters
     parser.add_argument('--data_path', default='/path/to/list_kinetics-400', type=str,
                         help='dataset path')

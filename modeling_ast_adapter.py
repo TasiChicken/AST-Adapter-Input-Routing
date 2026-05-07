@@ -37,7 +37,7 @@ def gumbel_softmax_sample(logits, temperature):
     return F.softmax(y / temperature, dim=-1)
 
 class GumbelNetwork(nn.Module):
-    def __init__(self, pre_network, sub_networks, post_network, predictor, tau=1.0):
+    def __init__(self, pre_network, sub_networks, post_network, predictor, tau=1.0, routing_mode="hard"):
         super().__init__()
 
         self.pre_network  = pre_network
@@ -46,6 +46,8 @@ class GumbelNetwork(nn.Module):
         self.predictor = predictor
 
         self.tau = tau
+
+        self.routing_mode = routing_mode
     
     def forward(self, x):
         logits = self.predictor(x)
@@ -54,23 +56,40 @@ class GumbelNetwork(nn.Module):
         values = [m(prep_x) for m in self.sub_nets]
         val = torch.stack(values, dim=1)  # [B, K, ...]
 
-        if self.training:
-            gumb = F.gumbel_softmax(logits, tau=self.tau, hard=True, dim=-1)
-            idx = gumb.argmax(dim=-1)
-            out = torch.einsum("bk,bk...->b...", gumb, val)
-        else:
-            prob = F.softmax(logits / self.tau, dim=-1)
-            idx = prob.argmax(dim=-1)
-            gbl = F.one_hot(idx, val.size(1)).float()
-            out = torch.einsum("bk,bk...->b...", gbl, val)
+        tau = max(float(self.tau), 1e-6)
+        prob = F.softmax(logits / tau, dim=-1)
 
+        if self.routing_mode == "hard":
+            if self.training:
+                weights = F.gumbel_softmax(
+                    logits,
+                    tau=tau,
+                    hard=True,
+                    dim=-1,
+                )
+                idx = weights.argmax(dim=-1)
+            else:
+                idx = prob.argmax(dim=-1)
+                weights = F.one_hot(idx, val.size(1)).float().to(val.device)
+
+        elif self.routing_mode == "soft":
+            weights = prob
+            idx = prob.argmax(dim=-1)
+
+        else:
+            raise ValueError(f"Unknown routing_mode: {self.routing_mode}")
+
+        out = torch.einsum("bk,bk...->b...", weights, val)
         out = self.post_network(out)
+
         aux = {
             "index": idx,
             "log_p": F.log_softmax(logits, dim=-1),
-            "prob": F.softmax(logits, dim=-1),
-            "gumbl": gumb if self.training else gbl,
+            "prob": prob,
+            "gumbl": weights,
+            "weights": weights,
         }
+
         return out, aux
     
 class paramnetwork(nn.Module):
@@ -336,7 +355,8 @@ class Block(nn.Module):
                 self.gumbel = GumbelNetwork(
                     pre, net_l, post,
                     predictor,
-                    self.config.tau_init
+                    self.config.tau_init,
+                    routing_mode=getattr(config, "gumbel_routing_mode", "hard"),
                 )
                 self.inter_key = names
         
@@ -431,7 +451,8 @@ class Block(nn.Module):
                 self.gumbel_a = GumbelNetwork(
                     pre_a, net_l_a, post_a,
                     predictor_a,
-                    self.config.tau_init
+                    self.config.tau_init,
+                    routing_mode=getattr(config, "gumbel_routing_mode", "hard"),
                 )
                 self.inter_key_a = names
 
