@@ -393,7 +393,8 @@ def main(args, ds_init):
         use_motion_gate=args.use_motion_gate,
         motion_gate_norm=args.motion_gate_norm,
         routing_hidden_dim=args.routing_hidden_dim,
-        routing_dropout=args.routing_dropout,        
+        routing_dropout=args.routing_dropout,   
+        gumbel_routing_mode=args.gumbel_routing_mode,
     )
 
     model = create_model(
