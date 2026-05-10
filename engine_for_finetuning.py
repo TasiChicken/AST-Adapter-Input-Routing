@@ -1,4 +1,3 @@
-from modeling_ast_adapter import model
 import os
 import numpy as np
 import math
