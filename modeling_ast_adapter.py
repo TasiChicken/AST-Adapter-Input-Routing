@@ -1,3 +1,4 @@
+from torch._dynamo import config
 from functools import partial
 import numpy as np
 import torch
@@ -98,7 +99,38 @@ class paramnetwork(nn.Module):
         self.p = nn.Parameter(t)
     def forward(self,x):
         return self.p.unsqueeze(0).expand(x.size(0),-1)
-    
+        
+class TinyVideoRoutingHead(nn.Module):
+    def __init__(self, dim, num_branches, hidden_dim=64, dropout=0.1):
+        super().__init__()
+
+        self.frame_proj = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+        )
+
+        self.out = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 3),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 3, num_branches),
+        )
+
+        nn.init.zeros_(self.out[-1].weight)
+        nn.init.zeros_(self.out[-1].bias)
+
+    def forward(self, x):
+        # x: [B, C, T, H, W]
+        xt = x.mean(dim=(3, 4)).transpose(1, 2)  # [B, T, C]
+        ft = self.frame_proj(xt)                 # [B, T, hidden]
+
+        mean_feat = ft.mean(dim=1)
+        max_feat = ft.max(dim=1).values
+        std_feat = ft.std(dim=1, unbiased=False)
+
+        z = torch.cat([mean_feat, max_feat, std_feat], dim=-1)
+        return self.out(z)
+
 class InputDependentParamNetwork(nn.Module):
     """
     Input-dependent routing predictor for AST-Adapter.
@@ -343,11 +375,11 @@ class Block(nn.Module):
                 motion_gate_norm = get_value(config, "motion_gate_norm", True)
 
                 if routing_type == "input":
-                    predictor = InputDependentParamNetwork(
+                    predictor = TinyVideoRoutingHead(
                         dim=dim,
                         num_branches=len(index),
-                        use_motion=use_motion_gate,
-                        motion_norm=motion_gate_norm,
+                        hidden_dim=getattr(config, "routing_hidden_dim", 64),
+                        dropout=getattr(config, "routing_dropout", 0.1),
                     )
                 else:
                     predictor = paramnetwork(torch.as_tensor(logit))
