@@ -1,3 +1,4 @@
+from modeling_ast_adapter import model
 import os
 import numpy as np
 import math
@@ -14,6 +15,97 @@ def train_class_batch(model, samples, target, criterion):
     outputs = model(samples)
     loss = criterion(outputs, target)
     return loss, outputs
+
+def get_routing_aux_weight(
+    epoch,
+    total_epochs,
+    max_weight=0.01,
+    warmup_epochs=5,
+    decay_start=20,
+    decay_end=50,
+):
+    """
+    Auxiliary loss schedule.
+
+    Early stage:
+        encourage routing exploration / avoid collapse.
+
+    Late stage:
+        decay to 0 so that classification loss dominates.
+    """
+    if max_weight <= 0:
+        return 0.0
+
+    if epoch < warmup_epochs:
+        return max_weight * float(epoch + 1) / float(max(warmup_epochs, 1))
+
+    if epoch < decay_start:
+        return max_weight
+
+    if epoch < decay_end:
+        progress = float(epoch - decay_start) / float(max(decay_end - decay_start, 1))
+        return max_weight * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return 0.0
+
+
+def collect_routing_probs(model):
+    """
+    Collect last_prob from each GumbelNetwork after model forward.
+
+    Returns:
+        probs: list of tensors, each [B, K]
+    """
+    probs = []
+    model_to_check = model.module if hasattr(model, "module") else model
+
+    for blk in model_to_check.blocks:
+        for module in blk.modules():
+            if hasattr(module, "last_prob"):
+                probs.append(module.last_prob)
+
+    return probs
+
+
+def routing_auxiliary_loss(
+    probs,
+    loss_type="anti_collapse",
+    collapse_threshold=0.90,
+    eps=1e-8,
+):
+    """
+    loss_type:
+        anti_collapse:
+            only penalize when one branch dominates the batch.
+            This is safer for accuracy.
+
+        balance:
+            force batch-level average branch usage to be close to uniform.
+            Stronger, but may hurt accuracy.
+    """
+    if len(probs) == 0 or loss_type == "none":
+        return None
+
+    losses = []
+
+    for p in probs:
+        # p: [B, K]
+        avg_p = p.mean(dim=0)  # [K]
+
+        if loss_type == "anti_collapse":
+            max_usage = avg_p.max()
+            loss = torch.relu(max_usage - collapse_threshold) ** 2
+
+        elif loss_type == "balance":
+            target = torch.ones_like(avg_p) / avg_p.numel()
+            loss = ((avg_p - target) ** 2).sum()
+
+        else:
+            raise ValueError(f"Unknown routing auxiliary loss type: {loss_type}")
+
+        losses.append(loss)
+
+    return sum(losses) / len(losses)    
 
 @torch.no_grad()
 def update_route_stats(model, route_stats, device, num_branches=3):
@@ -94,15 +186,26 @@ def get_loss_scale_for_deepspeed(model):
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
-                    model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None, log_writer=None,
-                    start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
-                    num_training_steps_per_epoch=None, update_freq=None):
+                    device: torch.device, epoch: int, loss_scaler,
+                    max_norm: float = 0, model_ema: Optional[ModelEma] = None,
+                    mixup_fn: Optional[Mixup] = None, log_writer=None,
+                    start_steps=None, lr_schedule_values=None,
+                    wd_schedule_values=None, num_training_steps_per_epoch=None,
+                    update_freq=None,
+                    routing_aux_loss="none",
+                    routing_aux_weight=0.0,
+                    routing_aux_warmup_epochs=5,
+                    routing_aux_decay_start=20,
+                    routing_aux_decay_end=50,
+                    routing_collapse_threshold=0.90,
+                    total_epochs=90):
     model.train(True)
     metric_logger = utils.MetricLogger(delimiter="  ")
     route_stats = {}
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('routing_aux', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('routing_aux_w', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
@@ -129,10 +232,53 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             samples = samples.half()
             loss, output = train_class_batch(
                 model, samples, targets, criterion)
+
+            routing_aux_value = torch.tensor(0.0, device=device)
+            lambda_routing = get_routing_aux_weight(
+                epoch=epoch,
+                total_epochs=total_epochs,
+                max_weight=routing_aux_weight,
+                warmup_epochs=routing_aux_warmup_epochs,
+                decay_start=routing_aux_decay_start,
+                decay_end=routing_aux_decay_end,
+            )
+
+            if routing_aux_loss != "none" and lambda_routing > 0:
+                routing_probs = collect_routing_probs(model)
+                aux_loss = routing_auxiliary_loss(
+                    routing_probs,
+                    loss_type=routing_aux_loss,
+                    collapse_threshold=routing_collapse_threshold,
+                )
+                if aux_loss is not None:
+                    routing_aux_value = aux_loss.detach()
+                    loss = loss + lambda_routing * aux_loss
+
         else:
             with torch.cuda.amp.autocast():
                 loss, output = train_class_batch(
                     model, samples, targets, criterion)
+
+                routing_aux_value = torch.tensor(0.0, device=device)
+                lambda_routing = get_routing_aux_weight(
+                    epoch=epoch,
+                    total_epochs=total_epochs,
+                    max_weight=routing_aux_weight,
+                    warmup_epochs=routing_aux_warmup_epochs,
+                    decay_start=routing_aux_decay_start,
+                    decay_end=routing_aux_decay_end,
+                )
+
+                if routing_aux_loss != "none" and lambda_routing > 0:
+                    routing_probs = collect_routing_probs(model)
+                    aux_loss = routing_auxiliary_loss(
+                        routing_probs,
+                        loss_type=routing_aux_loss,
+                        collapse_threshold=routing_collapse_threshold,
+                    )
+                    if aux_loss is not None:
+                        routing_aux_value = aux_loss.detach()
+                        loss = loss + lambda_routing * aux_loss
 
         update_route_stats(model, route_stats, device)
         loss_value = loss.item()
@@ -175,6 +321,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(loss=loss_value)
         metric_logger.update(class_acc=class_acc)
         metric_logger.update(loss_scale=loss_scale_value)
+        metric_logger.update(routing_aux=routing_aux_value.item())
+        metric_logger.update(routing_aux_w=lambda_routing)
         min_lr = 10.
         max_lr = 0.
         for group in optimizer.param_groups:
@@ -198,6 +346,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             log_writer.update(min_lr=min_lr, head="opt")
             log_writer.update(weight_decay=weight_decay_value, head="opt")
             log_writer.update(grad_norm=grad_norm, head="opt")
+            log_writer.update(routing_aux=routing_aux_value.item(), head="loss")
+            log_writer.update(routing_aux_w=lambda_routing, head="loss")
 
             log_writer.set_step()
 

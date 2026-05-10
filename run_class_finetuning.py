@@ -163,6 +163,50 @@ def get_args():
     parser.add_argument("--routing_hidden_dim", default=64, type=int)
     parser.add_argument("--routing_dropout", default=0.1, type=float)
 
+    # Auxiliary routing loss
+    parser.add_argument(
+        "--routing_aux_loss",
+        default="none",
+        choices=["none", "anti_collapse", "balance"],
+        type=str,
+        help="Auxiliary routing loss type."
+    )
+
+    parser.add_argument(
+        "--routing_aux_weight",
+        default=0.01,
+        type=float,
+        help="Maximum weight for routing auxiliary loss."
+    )
+
+    parser.add_argument(
+        "--routing_aux_warmup_epochs",
+        default=5,
+        type=int,
+        help="Warmup epochs for routing auxiliary loss."
+    )
+
+    parser.add_argument(
+        "--routing_aux_decay_start",
+        default=20,
+        type=int,
+        help="Epoch to start decaying routing auxiliary loss."
+    )
+
+    parser.add_argument(
+        "--routing_aux_decay_end",
+        default=50,
+        type=int,
+        help="Epoch to decay routing auxiliary loss to zero."
+    )
+
+    parser.add_argument(
+        "--routing_collapse_threshold",
+        default=0.90,
+        type=float,
+        help="Threshold for anti-collapse routing loss."
+    )
+
     # Dataset parameters
     parser.add_argument('--data_path', default='/path/to/list_kinetics-400', type=str,
                         help='dataset path')
@@ -348,6 +392,8 @@ def main(args, ds_init):
         routing_type=args.routing_type,
         use_motion_gate=args.use_motion_gate,
         motion_gate_norm=args.motion_gate_norm,
+        routing_hidden_dim=args.routing_hidden_dim,
+        routing_dropout=args.routing_dropout,        
     )
 
     model = create_model(
@@ -583,11 +629,23 @@ def main(args, ds_init):
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
         train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer,
-            device, epoch, loss_scaler, args.clip_grad, model_ema, mixup_fn,
-            log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
-            lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
-            num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
+            model, criterion, data_loader_train, optimizer, device, epoch, loss_scaler,
+            args.clip_grad, model_ema, mixup_fn,
+            log_writer=log_writer,
+            start_steps=epoch * num_training_steps_per_epoch,
+            lr_schedule_values=lr_schedule_values,
+            wd_schedule_values=wd_schedule_values,
+            num_training_steps_per_epoch=num_training_steps_per_epoch,
+            update_freq=args.update_freq,
+
+            # new routing auxiliary loss config
+            routing_aux_loss=args.routing_aux_loss,
+            routing_aux_weight=args.routing_aux_weight,
+            routing_aux_warmup_epochs=args.routing_aux_warmup_epochs,
+            routing_aux_decay_start=args.routing_aux_decay_start,
+            routing_aux_decay_end=args.routing_aux_decay_end,
+            routing_collapse_threshold=args.routing_collapse_threshold,
+            total_epochs=args.epochs,
         )
         if args.output_dir and args.save_ckpt:
             if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:

@@ -60,6 +60,10 @@ class GumbelNetwork(nn.Module):
         tau = max(float(self.tau), 1e-6)
         prob = F.softmax(logits / tau, dim=-1)
 
+        # Save routing probability for auxiliary routing loss and analysis.
+        self.last_prob = prob
+        self.last_logits = logits
+
         if self.routing_mode == "hard":
             if self.training:
                 weights = F.gumbel_softmax(
@@ -85,7 +89,7 @@ class GumbelNetwork(nn.Module):
 
         aux = {
             "index": idx,
-            "log_p": F.log_softmax(logits, dim=-1),
+            "log_p": F.log_softmax(logits / tau, dim=-1),
             "prob": prob,
             "gumbl": weights,
             "weights": weights,
