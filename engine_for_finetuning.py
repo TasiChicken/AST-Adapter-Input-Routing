@@ -47,6 +47,32 @@ def get_routing_aux_weight(
 
     return 0.0
 
+def get_routing_explore_eps(epoch, max_eps=0.0, decay_end=50):
+    """
+    Cosine decay exploration probability.
+
+    epoch 0: max_eps
+    epoch >= decay_end: 0
+    """
+    if max_eps <= 0:
+        return 0.0
+
+    if epoch >= decay_end:
+        return 0.0
+
+    progress = float(epoch) / float(max(decay_end, 1))
+    return max_eps * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def set_routing_explore_eps(model, eps):
+    """
+    Set explore_eps for all GumbelNetwork modules.
+    """
+    model_to_check = model.module if hasattr(model, "module") else model
+
+    for module in model_to_check.modules():
+        if hasattr(module, "explore_eps"):
+            module.explore_eps = float(eps)
 
 def collect_routing_probs(model):
     """
@@ -65,22 +91,32 @@ def collect_routing_probs(model):
 
     return probs
 
-
 def routing_auxiliary_loss(
     probs,
     loss_type="anti_collapse",
     collapse_threshold=0.90,
+    entropy_weight=0.0,
     eps=1e-8,
 ):
     """
     loss_type:
+        none:
+            no auxiliary loss.
+
         anti_collapse:
             only penalize when one branch dominates the batch.
-            This is safer for accuracy.
+            Conservative, but may be too weak.
 
         balance:
-            force batch-level average branch usage to be close to uniform.
-            Stronger, but may hurt accuracy.
+            L2 loss between batch-average routing and uniform distribution.
+
+        kl_balance:
+            KL divergence between batch-average routing and uniform distribution.
+            Usually smoother than L2.
+
+        kl_entropy:
+            KL balance + per-sample entropy warmup.
+            More effective for preventing early one-hot collapse.
     """
     if len(probs) == 0 or loss_type == "none":
         return None
@@ -90,28 +126,150 @@ def routing_auxiliary_loss(
     for p in probs:
         # p: [B, K]
         avg_p = p.mean(dim=0)  # [K]
+        k = avg_p.numel()
+        target = torch.ones_like(avg_p) / k
 
         if loss_type == "anti_collapse":
             max_usage = avg_p.max()
             loss = torch.relu(max_usage - collapse_threshold) ** 2
 
         elif loss_type == "balance":
-            target = torch.ones_like(avg_p) / avg_p.numel()
             loss = ((avg_p - target) ** 2).sum()
+
+        elif loss_type == "kl_balance":
+            loss = (
+                avg_p * (
+                    torch.log(avg_p + eps) -
+                    torch.log(target + eps)
+                )
+            ).sum()
+
+        elif loss_type == "kl_entropy":
+            kl_loss = (
+                avg_p * (
+                    torch.log(avg_p + eps) -
+                    torch.log(target + eps)
+                )
+            ).sum()
+
+            # Encourage per-sample routing not to become one-hot too early.
+            entropy = -(p * torch.log(p + eps)).sum(dim=-1)
+            entropy = entropy / math.log(k)
+            entropy_loss = 1.0 - entropy.mean()
+
+            loss = kl_loss + entropy_weight * entropy_loss
 
         else:
             raise ValueError(f"Unknown routing auxiliary loss type: {loss_type}")
 
         losses.append(loss)
 
-    return sum(losses) / len(losses)    
+    return sum(losses) / len(losses)   
+
+def _get_branch_names_from_block(blk, num_branches):
+    """
+    Get branch names from block if available.
+    Works for sp_tp_relu and sp_tp.
+    """
+    if hasattr(blk, "inter_key") and blk.inter_key:
+        return list(blk.inter_key)
+
+    if hasattr(blk, "inter_key_a") and blk.inter_key_a:
+        return list(blk.inter_key_a)
+
+    default_names = ["sp", "tp", "relu"]
+    return default_names[:num_branches]
+
 
 @torch.no_grad()
-def update_route_stats(model, route_stats, device, num_branches=3):
+def update_soft_route_stats(model, soft_route_stats, device):
     """
-    Update routing statistics for the current batch.
-    This should be called after output = model(videos),
-    because blk.inter_idx is created during forward.
+    Accumulate soft routing probability statistics over all batches.
+    Uses last_prob from each GumbelNetwork after forward.
+    """
+    model_to_check = model.module if hasattr(model, "module") else model
+
+    for layer_id, blk in enumerate(model_to_check.blocks):
+        probs = []
+
+        for module in blk.modules():
+            if hasattr(module, "last_prob"):
+                probs.append(module.last_prob.detach())
+
+        if len(probs) == 0:
+            continue
+
+        p = probs[-1]  # [B, K]
+        p_sum = p.sum(dim=0).to(device)
+        count = torch.tensor(float(p.size(0)), device=device)
+
+        branch_names = _get_branch_names_from_block(blk, p.size(-1))
+
+        if layer_id not in soft_route_stats:
+            soft_route_stats[layer_id] = {
+                "sum": torch.zeros_like(p_sum, device=device),
+                "count": torch.tensor(0.0, device=device),
+                "branch_names": branch_names,
+            }
+
+        soft_route_stats[layer_id]["sum"] += p_sum
+        soft_route_stats[layer_id]["count"] += count
+
+
+@torch.no_grad()
+def sync_soft_route_stats(soft_route_stats, device):
+    """
+    Synchronize soft routing probability statistics across DDP ranks.
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        for layer_id in soft_route_stats:
+            soft_route_stats[layer_id]["sum"] = soft_route_stats[layer_id]["sum"].to(device)
+            soft_route_stats[layer_id]["count"] = soft_route_stats[layer_id]["count"].to(device)
+
+            torch.distributed.all_reduce(
+                soft_route_stats[layer_id]["sum"],
+                op=torch.distributed.ReduceOp.SUM,
+            )
+            torch.distributed.all_reduce(
+                soft_route_stats[layer_id]["count"],
+                op=torch.distributed.ReduceOp.SUM,
+            )
+
+    return soft_route_stats
+
+
+@torch.no_grad()
+def print_soft_route_stats(soft_route_stats, title="[Soft Routing Probability Statistics]"):
+    """
+    Print averaged softmax probability over all accumulated batches.
+    This is different from inter_idx / argmax statistics.
+    """
+    if len(soft_route_stats) == 0:
+        print(f"\n{title}")
+        print("No soft routing statistics found.")
+        return
+
+    print(f"\n{title}")
+
+    for layer_id in sorted(soft_route_stats.keys()):
+        stat = soft_route_stats[layer_id]
+        p = stat["sum"] / stat["count"].clamp(min=1.0)
+        p = p.detach().cpu()
+
+        branch_names = stat.get("branch_names", ["sp", "tp", "relu"][:p.numel()])
+
+        ratio_str = ", ".join([
+            f"{branch_names[i]}={p[i].item():.4f}"
+            for i in range(min(len(branch_names), p.numel()))
+        ])
+
+        print(f"Layer {layer_id:02d}: {ratio_str}")
+
+@torch.no_grad()
+def update_route_stats(model, route_stats, device):
+    """
+    Update hard / argmax routing statistics for the current batch.
+    This reads blk.inter_idx, so it is branch-choice statistics, not soft probability.
     """
     model_to_check = model.module if hasattr(model, "module") else model
 
@@ -119,64 +277,105 @@ def update_route_stats(model, route_stats, device, num_branches=3):
         if hasattr(blk, "inter_idx"):
             idx = blk.inter_idx.detach().to(device).long()  # [B]
 
+            if hasattr(blk, "inter_key") and blk.inter_key:
+                branch_names = list(blk.inter_key)
+                num_branches = len(branch_names)
+            else:
+                num_branches = int(idx.max().item()) + 1 if idx.numel() > 0 else 3
+                branch_names = ["sp", "tp", "relu"][:num_branches]
+
             if layer_id not in route_stats:
-                route_stats[layer_id] = torch.zeros(
-                    num_branches,
-                    dtype=torch.long,
-                    device=device
-                )
+                route_stats[layer_id] = {
+                    "counts": torch.zeros(
+                        num_branches,
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                    "branch_names": branch_names,
+                }
 
             counts = torch.bincount(idx, minlength=num_branches)
-            route_stats[layer_id] += counts
-
+            route_stats[layer_id]["counts"] += counts
 
 @torch.no_grad()
 def sync_route_stats(route_stats, device):
     """
-    Synchronize routing statistics across all DDP ranks.
-    Without this, each process only reports its own local subset.
+    Synchronize hard / argmax routing statistics across all DDP ranks.
     """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         for layer_id in route_stats:
-            route_stats[layer_id] = route_stats[layer_id].to(device)
+            route_stats[layer_id]["counts"] = route_stats[layer_id]["counts"].to(device)
             torch.distributed.all_reduce(
-                route_stats[layer_id],
-                op=torch.distributed.ReduceOp.SUM
+                route_stats[layer_id]["counts"],
+                op=torch.distributed.ReduceOp.SUM,
             )
 
     return route_stats
+
+@torch.no_grad()
+def print_soft_route_stats(model, title="[Soft Routing Probability Statistics]"):
+    """
+    Print average softmax probability of each branch from last_prob.
+
+    This is different from inter_idx / argmax statistics.
+    """
+    model_to_check = model.module if hasattr(model, "module") else model
+    branch_names = ["sp", "tp", "relu"]
+
+    print(f"\n{title}")
+
+    for layer_id, blk in enumerate(model_to_check.blocks):
+        probs = []
+
+        for module in blk.modules():
+            if hasattr(module, "last_prob"):
+                probs.append(module.last_prob.detach())
+
+        if len(probs) == 0:
+            continue
+
+        p = probs[-1].mean(dim=0).cpu()
+
+        ratio_str = ", ".join([
+            f"{branch_names[i]}={p[i].item():.4f}"
+            for i in range(min(len(branch_names), p.numel()))
+        ])
+
+        print(f"Layer {layer_id:02d}: {ratio_str}")
 
 
 @torch.no_grad()
 def print_route_stats(route_stats, title="[AST-Adapter Routing Statistics]"):
     """
-    Print routing statistics.
-    Only call this on the main process to avoid duplicate logs.
+    Print hard / argmax routing statistics.
     """
     if len(route_stats) == 0:
         print(f"\n{title}")
         print("No routing statistics found.")
         return
 
-    branch_names = ["sp", "tp", "relu"]
-
     print(f"\n{title}")
+
     for layer_id in sorted(route_stats.keys()):
-        counts = route_stats[layer_id].detach().cpu().float()
+        counts = route_stats[layer_id]["counts"].detach().cpu().float()
         ratio = counts / counts.sum().clamp(min=1)
+
+        branch_names = route_stats[layer_id].get(
+            "branch_names",
+            ["sp", "tp", "relu"][:counts.numel()],
+        )
 
         ratio_str = ", ".join([
             f"{branch_names[i]}={ratio[i].item():.3f}"
-            for i in range(len(branch_names))
+            for i in range(min(len(branch_names), counts.numel()))
         ])
 
         count_str = ", ".join([
             f"{branch_names[i]}={int(counts[i].item())}"
-            for i in range(len(branch_names))
+            for i in range(min(len(branch_names), counts.numel()))
         ])
 
-        print(f"Layer {layer_id:02d}: {ratio_str} | counts: {count_str}")    
-
+        print(f"Layer {layer_id:02d}: {ratio_str} | counts: {count_str}")
 
 def get_loss_scale_for_deepspeed(model):
     optimizer = model.optimizer
@@ -197,10 +396,23 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     routing_aux_decay_start=20,
                     routing_aux_decay_end=50,
                     routing_collapse_threshold=0.90,
-                    total_epochs=90):
+                    total_epochs=90,
+                    routing_explore_eps=0.0,
+                    routing_explore_decay_end=50,
+                    routing_entropy_weight=0.0,):
     model.train(True)
+    current_explore_eps = get_routing_explore_eps(
+        epoch=epoch,
+        max_eps=routing_explore_eps,
+        decay_end=routing_explore_decay_end,
+    )
+
+    set_routing_explore_eps(model, current_explore_eps)
+
+    print(f"Routing explore eps = {current_explore_eps:.6f}")
     metric_logger = utils.MetricLogger(delimiter="  ")
     route_stats = {}
+    soft_route_stats = {}
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('routing_aux', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -248,6 +460,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     routing_probs,
                     loss_type=routing_aux_loss,
                     collapse_threshold=routing_collapse_threshold,
+                    entropy_weight=routing_entropy_weight,
                 )
                 if aux_loss is not None:
                     routing_aux_value = aux_loss.detach()
@@ -274,12 +487,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                         routing_probs,
                         loss_type=routing_aux_loss,
                         collapse_threshold=routing_collapse_threshold,
+                        entropy_weight=routing_entropy_weight,
                     )
                     if aux_loss is not None:
                         routing_aux_value = aux_loss.detach()
                         loss = loss + lambda_routing * aux_loss
 
         update_route_stats(model, route_stats, device)
+        update_soft_route_stats(model, soft_route_stats, device)
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
@@ -355,11 +570,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
     # gather routing stats from all DDP ranks
     route_stats = sync_route_stats(route_stats, device)
+    soft_route_stats = sync_soft_route_stats(soft_route_stats, device)
 
     print("Averaged stats:", metric_logger)
 
     if utils.is_main_process():
         print_route_stats(route_stats, title=f"[Train AST-Adapter Routing Statistics][Epoch {epoch}]")
+        print_soft_route_stats(
+            soft_route_stats,
+            title=f"[Train Soft Routing Probability Statistics][Epoch {epoch}]",
+        )
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
@@ -374,6 +594,7 @@ def validation_one_epoch(data_loader, model, device):
     model.eval()
 
     route_stats = {}
+    soft_route_stats = {}
 
     for batch in metric_logger.log_every(data_loader, 10, header):
         videos = batch[0]
@@ -387,6 +608,7 @@ def validation_one_epoch(data_loader, model, device):
 
             # update routing statistics after forward
             update_route_stats(model, route_stats, device)
+            update_soft_route_stats(model, soft_route_stats, device)
 
             loss = criterion(output, target)
 
@@ -402,6 +624,7 @@ def validation_one_epoch(data_loader, model, device):
 
     # gather routing stats from all DDP ranks
     route_stats = sync_route_stats(route_stats, device)
+    soft_route_stats = sync_soft_route_stats(soft_route_stats, device)
 
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
@@ -409,6 +632,7 @@ def validation_one_epoch(data_loader, model, device):
     # print only on main process
     if utils.is_main_process():
         print_route_stats(route_stats, title="[Val AST-Adapter Routing Statistics]")
+        print_soft_route_stats(soft_route_stats, title="[Val Soft Routing Probability Statistics]")
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
@@ -425,6 +649,7 @@ def final_test(data_loader, model, device, file):
     model.eval()
     final_result = []
     route_stats = {}
+    soft_route_stats = {}
     
     for batch in metric_logger.log_every(data_loader, 10, header):
         videos = batch[0]
@@ -442,6 +667,7 @@ def final_test(data_loader, model, device, file):
 
         # AST-Adapter routing statistics
         update_route_stats(model, route_stats, device)
+        update_soft_route_stats(model, soft_route_stats, device)
 
         for i in range(output.size(0)):
             string = "{} {} {} {} {}\n".format(ids[i], \
@@ -471,10 +697,15 @@ def final_test(data_loader, model, device, file):
 
     # gather routing stats from all DDP ranks
     route_stats = sync_route_stats(route_stats, device)
+    soft_route_stats = sync_soft_route_stats(soft_route_stats, device)
 
     # Print AST-Adapter routing statistics only on main process
     if utils.is_main_process():
         print_route_stats(route_stats, title="[Test AST-Adapter Routing Statistics]")
+        print_soft_route_stats(
+            soft_route_stats,
+            title="[Test Soft Routing Probability Statistics]",
+        )
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 

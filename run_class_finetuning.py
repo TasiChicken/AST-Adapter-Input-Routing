@@ -163,13 +163,33 @@ def get_args():
     parser.add_argument("--routing_hidden_dim", default=64, type=int)
     parser.add_argument("--routing_dropout", default=0.1, type=float)
 
+    parser.add_argument(
+        "--routing_explore_eps",
+        default=0.0,
+        type=float,
+        help="Maximum epsilon for early routing exploration."
+    )
+
+    parser.add_argument(
+        "--routing_explore_decay_end",
+        default=50,
+        type=int,
+        help="Epoch to decay routing exploration epsilon to zero."
+    )
+
+    parser.add_argument(
+        "--routing_entropy_weight",
+        default=0.0,
+        type=float,
+        help="Entropy weight used when routing_aux_loss=kl_entropy."
+    )
+
     # Auxiliary routing loss
     parser.add_argument(
         "--routing_aux_loss",
         default="none",
-        choices=["none", "anti_collapse", "balance"],
+        choices=["none", "anti_collapse", "balance", "kl_balance", "kl_entropy"],
         type=str,
-        help="Auxiliary routing loss type."
     )
 
     parser.add_argument(
@@ -639,7 +659,6 @@ def main(args, ds_init):
             num_training_steps_per_epoch=num_training_steps_per_epoch,
             update_freq=args.update_freq,
 
-            # new routing auxiliary loss config
             routing_aux_loss=args.routing_aux_loss,
             routing_aux_weight=args.routing_aux_weight,
             routing_aux_warmup_epochs=args.routing_aux_warmup_epochs,
@@ -647,6 +666,10 @@ def main(args, ds_init):
             routing_aux_decay_end=args.routing_aux_decay_end,
             routing_collapse_threshold=args.routing_collapse_threshold,
             total_epochs=args.epochs,
+
+            routing_explore_eps=args.routing_explore_eps,
+            routing_explore_decay_end=args.routing_explore_decay_end,
+            routing_entropy_weight=args.routing_entropy_weight,
         )
         if args.output_dir and args.save_ckpt:
             if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:

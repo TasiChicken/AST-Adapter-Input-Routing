@@ -1,4 +1,3 @@
-from torch._dynamo import config
 from functools import partial
 import numpy as np
 import torch
@@ -40,15 +39,16 @@ def gumbel_softmax_sample(logits, temperature):
 class GumbelNetwork(nn.Module):
     def __init__(self, pre_network, sub_networks, post_network, predictor, tau=1.0, routing_mode="hard"):
         super().__init__()
-
-        self.pre_network  = pre_network
-        self.sub_nets     = nn.ModuleList(sub_networks)
+        self.pre_network = pre_network
+        self.sub_nets = nn.ModuleList(sub_networks)
         self.post_network = post_network
         self.predictor = predictor
-
         self.tau = tau
-
         self.routing_mode = routing_mode
+
+        # Exploration probability for early-stage routing exploration.
+        # It will be updated from engine_for_finetuning.py each epoch.
+        self.explore_eps = 0.0
     
     def forward(self, x):
         logits = self.predictor(x)
@@ -58,21 +58,54 @@ class GumbelNetwork(nn.Module):
         val = torch.stack(values, dim=1)  # [B, K, ...]
 
         tau = max(float(self.tau), 1e-6)
-        prob = F.softmax(logits / tau, dim=-1)
+        base_prob = F.softmax(logits / tau, dim=-1)
 
-        # Save routing probability for auxiliary routing loss and analysis.
-        self.last_prob = prob
-        self.last_logits = logits
+        explore_eps = float(getattr(self, "explore_eps", 0.0))
+        use_explore = self.training and explore_eps > 0.0
+
+        # This prob is used for soft routing, auxiliary loss, and soft routing logging.
+        # During early exploration, mix learned probability with uniform distribution.
+        if use_explore:
+            k = base_prob.size(-1)
+            prob = (1.0 - explore_eps) * base_prob + explore_eps / k
+        else:
+            prob = base_prob
 
         if self.routing_mode == "hard":
             if self.training:
-                weights = F.gumbel_softmax(
+                learned_weights = F.gumbel_softmax(
                     logits,
                     tau=tau,
                     hard=True,
                     dim=-1,
                 )
+
+                # Epsilon-greedy hard exploration:
+                # with probability explore_eps, override learned branch with a random branch.
+                # This makes exploration also affect hard routing choices.
+                if use_explore:
+                    bsz, k = logits.shape
+                    random_idx = torch.randint(
+                        low=0,
+                        high=k,
+                        size=(bsz,),
+                        device=logits.device,
+                    )
+                    random_weights = F.one_hot(random_idx, num_classes=k).to(
+                        dtype=learned_weights.dtype,
+                        device=learned_weights.device,
+                    )
+
+                    explore_mask = (
+                        torch.rand(bsz, 1, device=logits.device) < explore_eps
+                    ).to(dtype=learned_weights.dtype)
+
+                    weights = explore_mask * random_weights + (1.0 - explore_mask) * learned_weights
+                else:
+                    weights = learned_weights
+
                 idx = weights.argmax(dim=-1)
+
             else:
                 idx = prob.argmax(dim=-1)
                 weights = F.one_hot(idx, val.size(1)).float().to(val.device)
@@ -84,6 +117,12 @@ class GumbelNetwork(nn.Module):
         else:
             raise ValueError(f"Unknown routing_mode: {self.routing_mode}")
 
+        # Save routing probability and weights for auxiliary loss and analysis.
+        self.last_prob = prob
+        self.last_base_prob = base_prob
+        self.last_logits = logits
+        self.last_weights = weights
+
         out = torch.einsum("bk,bk...->b...", weights, val)
         out = self.post_network(out)
 
@@ -91,12 +130,13 @@ class GumbelNetwork(nn.Module):
             "index": idx,
             "log_p": F.log_softmax(logits / tau, dim=-1),
             "prob": prob,
+            "base_prob": base_prob,
             "gumbl": weights,
             "weights": weights,
         }
 
         return out, aux
-    
+
 class paramnetwork(nn.Module):
     def __init__(self,t):
         super().__init__()
