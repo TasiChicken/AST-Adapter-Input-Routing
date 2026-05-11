@@ -313,38 +313,6 @@ def sync_route_stats(route_stats, device):
     return route_stats
 
 @torch.no_grad()
-def print_soft_route_stats(model, title="[Soft Routing Probability Statistics]"):
-    """
-    Print average softmax probability of each branch from last_prob.
-
-    This is different from inter_idx / argmax statistics.
-    """
-    model_to_check = model.module if hasattr(model, "module") else model
-    branch_names = ["sp", "tp", "relu"]
-
-    print(f"\n{title}")
-
-    for layer_id, blk in enumerate(model_to_check.blocks):
-        probs = []
-
-        for module in blk.modules():
-            if hasattr(module, "last_prob"):
-                probs.append(module.last_prob.detach())
-
-        if len(probs) == 0:
-            continue
-
-        p = probs[-1].mean(dim=0).cpu()
-
-        ratio_str = ", ".join([
-            f"{branch_names[i]}={p[i].item():.4f}"
-            for i in range(min(len(branch_names), p.numel()))
-        ])
-
-        print(f"Layer {layer_id:02d}: {ratio_str}")
-
-
-@torch.no_grad()
 def print_route_stats(route_stats, title="[AST-Adapter Routing Statistics]"):
     """
     Print hard / argmax routing statistics.
