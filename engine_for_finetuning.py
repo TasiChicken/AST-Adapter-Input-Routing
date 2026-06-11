@@ -286,7 +286,8 @@ def final_test(data_loader, model, device, file):
         videos = videos.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
-        # compute output
+        if utils.is_main_process() and len(final_result) == 0:
+            print("final_test videos shape:", videos.shape, flush=True)
         with torch.cuda.amp.autocast():
             output = model(videos)
             loss = criterion(output, target)

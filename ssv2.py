@@ -145,6 +145,12 @@ class SSVideoClsDataset(Dataset):
             else:
                 buffer = buffer[temporal_start::2, \
                        :, spatial_start:spatial_start + self.short_side_size, :]
+                
+            # SSV2 test safety fix:
+            # ensure final temporal length equals args.num_frames
+            buffer = buffer[:self.num_segment]
+            while buffer.shape[0] < self.num_segment:
+                buffer = np.concatenate([buffer, buffer[-1:]], axis=0)
 
             buffer = self.data_transform(buffer)
             return buffer, self.test_label_array[index], sample.split("/")[-1].split(".")[0], \
